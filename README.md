@@ -116,6 +116,57 @@ When these index files are lost (corruption, reinstall, etc.), the Desktop app c
 - **Idempotent**: Safe to run multiple times — already-registered sessions are skipped
 - **Dry run**: Use `--dry-run` to preview changes before committing
 
+## MCP Server — Search Sessions from Inside Claude
+
+The MCP server lets Claude search your session history during conversations. Ask things like:
+- "What did we discuss about auth last week?"
+- "Find the session where we set up the database"
+- "Search my history for voicebox"
+
+### Setup
+
+1. Install dependencies:
+```bash
+cd mcp-server && npm install
+```
+
+2. Add to your Claude Desktop config:
+
+**Windows** (`%APPDATA%\Claude\claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "session-search": {
+      "command": "node",
+      "args": ["C:\\path\\to\\claude-session-recovery\\mcp-server\\index.mjs"]
+    }
+  }
+}
+```
+
+**macOS** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "session-search": {
+      "command": "node",
+      "args": ["/path/to/claude-session-recovery/mcp-server/index.mjs"]
+    }
+  }
+}
+```
+
+3. Restart Claude Desktop.
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_sessions` | Search all sessions for a keyword/phrase. Returns ranked results with context snippets. |
+| `list_sessions` | List recent sessions with dates, projects, and previews. |
+
+Claude will automatically use these tools when you ask about past conversations.
+
 ## Common Scenarios
 
 ### "Sessions disappeared after a BSOD/crash"

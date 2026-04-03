@@ -33,6 +33,7 @@ No external dependencies.
 
 import json
 import os
+import re
 import sys
 import glob
 import argparse
@@ -411,6 +412,152 @@ def cmd_export(args, claude_dir):
     print(f"\nExported {exported} sessions to {output_dir}/")
 
 
+def cmd_search(args, claude_dir):
+    """Search across all sessions for a keyword or pattern."""
+    query = args.query
+    case_insensitive = not args.case_sensitive
+
+    if args.regex:
+        try:
+            flags = re.IGNORECASE if case_insensitive else 0
+            pattern = re.compile(query, flags)
+        except re.error as e:
+            print(f"ERROR: Invalid regex pattern: {e}")
+            sys.exit(1)
+    else:
+        pattern = None
+
+    # Build title map from desktop app registration files
+    titles = {}
+    _, user_dir = find_desktop_sessions_dir()
+    if user_dir:
+        for reg_file in user_dir.glob("local_*.json"):
+            try:
+                with open(reg_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cli_id = data.get("cliSessionId", "")
+                if cli_id:
+                    titles[cli_id] = data.get("title", "")
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    projects_dir = claude_dir / "projects"
+    if not projects_dir.exists():
+        print(f"ERROR: No projects directory at {projects_dir}")
+        sys.exit(1)
+
+    results = []
+    file_pattern = str(projects_dir / "*" / "*.jsonl")
+
+    for filepath in glob.glob(file_pattern):
+        filepath = Path(filepath)
+        session_id = filepath.stem
+        project = filepath.parent.name
+
+        if len(session_id) < 30 or "-" not in session_id:
+            continue
+
+        if args.project and args.project.lower() not in project.lower():
+            continue
+
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        # Count matches
+        if pattern:
+            matches = pattern.findall(content)
+            match_count = len(matches)
+        else:
+            search_content = content.lower() if case_insensitive else content
+            search_query = query.lower() if case_insensitive else query
+            match_count = search_content.count(search_query)
+
+        if match_count == 0:
+            continue
+
+        # Extract matching context snippets
+        snippets = []
+        if pattern:
+            for m in pattern.finditer(content):
+                start = max(0, m.start() - 60)
+                end = min(len(content), m.end() + 60)
+                snippet = content[start:end].replace("\n", " ").strip()
+                # Highlight the match
+                snippet = snippet.replace(m.group(), f"**{m.group()}**")
+                snippets.append(snippet)
+                if len(snippets) >= args.context_count:
+                    break
+        else:
+            idx = 0
+            sq = query.lower() if case_insensitive else query
+            sc = content.lower() if case_insensitive else content
+            while len(snippets) < args.context_count:
+                pos = sc.find(sq, idx)
+                if pos == -1:
+                    break
+                start = max(0, pos - 60)
+                end = min(len(content), pos + len(query) + 60)
+                snippet = content[start:end].replace("\n", " ").strip()
+                # Highlight match (preserve original case)
+                match_text = content[pos:pos + len(query)]
+                snippet_lower = snippet.lower()
+                match_pos = snippet_lower.find(sq)
+                if match_pos >= 0:
+                    original_match = snippet[match_pos:match_pos + len(query)]
+                    snippet = snippet[:match_pos] + f"**{original_match}**" + snippet[match_pos + len(query):]
+                snippets.append(snippet)
+                idx = pos + len(query)
+
+        stat = filepath.stat()
+        modified = datetime.datetime.fromtimestamp(stat.st_mtime)
+
+        title = titles.get(session_id, "")
+        if not title:
+            title = extract_preview(filepath, max_bytes=10000)[:60]
+
+        results.append({
+            "session_id": session_id,
+            "project": project,
+            "title": title,
+            "date": modified.strftime("%Y-%m-%d"),
+            "match_count": match_count,
+            "snippets": snippets,
+        })
+
+    # Sort by match count (most relevant first)
+    results.sort(key=lambda r: r["match_count"], reverse=True)
+
+    if not results:
+        print(f'\nNo sessions contain "{query}".')
+        return
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return
+
+    print(f"\n{'=' * 100}")
+    print(f'  Found "{query}" in {len(results)} sessions ({sum(r["match_count"] for r in results)} total matches)')
+    print(f"{'=' * 100}\n")
+
+    for i, r in enumerate(results, 1):
+        print(f"  {i:2}. [{r['date']}]  {r['match_count']:>4} matches  {r['title'][:60]}")
+        print(f"      Project: {r['project']}")
+        print(f"      Resume:  claude --resume {r['session_id']}")
+        if r["snippets"]:
+            for snippet in r["snippets"]:
+                # Truncate long snippets for display
+                display = snippet[:120]
+                if len(snippet) > 120:
+                    display += "..."
+                print(f"      > {display}")
+        print()
+
+    print(f"{'=' * 100}\n")
+
+
 def extract_transcript(filepath):
     """Extract a readable transcript from a session JSONL file."""
     messages = []
@@ -470,6 +617,9 @@ examples:
   python recover.py list                      List all sessions on disk
   python recover.py list --json               Output as JSON for scripting
   python recover.py list --project "website"  Filter by project name
+  python recover.py search "voicebox"         Find sessions mentioning voicebox
+  python recover.py search "API key" -n 5     Show 5 context snippets per match
+  python recover.py search "def.*main" -r     Search with regex
   python recover.py restore                   Re-register sessions in Desktop app
   python recover.py restore --dry-run         Preview what would be restored
   python recover.py export                    Export transcripts to text files
@@ -490,6 +640,15 @@ examples:
     restore_parser.add_argument("--dry-run", action="store_true", help="Preview without making changes")
     restore_parser.add_argument("--project", help="Filter by project name substring")
 
+    # search
+    search_parser = subparsers.add_parser("search", help="Search across all sessions")
+    search_parser.add_argument("query", help="Search term or regex pattern")
+    search_parser.add_argument("-r", "--regex", action="store_true", help="Treat query as regex")
+    search_parser.add_argument("-c", "--case-sensitive", action="store_true", help="Case-sensitive search")
+    search_parser.add_argument("-n", "--context-count", type=int, default=3, help="Number of context snippets per session (default: 3)")
+    search_parser.add_argument("--project", help="Filter by project name substring")
+    search_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
     # export
     export_parser = subparsers.add_parser("export", help="Export session transcripts to text files")
     export_parser.add_argument("--export-dir", default="./exported-sessions", help="Output directory")
@@ -505,6 +664,8 @@ examples:
 
     if args.command == "list":
         cmd_list(args, claude_dir)
+    elif args.command == "search":
+        cmd_search(args, claude_dir)
     elif args.command == "restore":
         cmd_restore(args, claude_dir)
     elif args.command == "export":
