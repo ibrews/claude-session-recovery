@@ -150,8 +150,42 @@ def derive_title(preview, max_len=60):
     return title if title else "(recovered session)"
 
 
-def derive_work_dir(project_name):
-    """Convert a project folder name back to a filesystem path."""
+def extract_cwd(filepath, max_bytes=20000):
+    """Extract the working directory from a session JSONL file.
+
+    The JSONL data contains the actual cwd used when the session was created.
+    This is far more reliable than trying to reverse-engineer the path from
+    the project folder name (which uses -- as separator and is ambiguous with
+    hyphens in actual path segments).
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_bytes)
+
+        for line in content.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line.strip())
+                cwd = obj.get("cwd") or obj.get("workingDirectory") or obj.get("originCwd")
+                if cwd:
+                    return cwd
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
+def derive_work_dir_fallback(project_name):
+    """Fallback: guess filesystem path from project folder name.
+
+    Only used when cwd can't be extracted from the JSONL data. This is
+    unreliable because hyphens in folder names are ambiguous — the project
+    folder name uses -- as the path separator, but single hyphens could be
+    either literal hyphens or path separators.
+    """
     work_dir = project_name.replace("--", os.sep)
     if sys.platform == "win32":
         if len(work_dir) > 1 and work_dir[1] == os.sep:
@@ -189,10 +223,13 @@ def scan_sessions(claude_dir, project_filter=None):
         size_kb = stat.st_size // 1024
         preview = extract_preview(filepath)
 
+        # Get actual cwd from session data; fall back to deriving from folder name
+        work_dir = extract_cwd(filepath) or derive_work_dir_fallback(project)
+
         sessions.append({
             "id": session_id,
             "project": project,
-            "work_dir": derive_work_dir(project),
+            "work_dir": work_dir,
             "date": modified.strftime("%Y-%m-%d %H:%M"),
             "date_sort": modified,
             "size_kb": size_kb,
