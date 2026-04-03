@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+Claude Code Session Recovery Tool
+
+Recovers sessions that disappear from the Claude Desktop app after crashes,
+BSODs, disk errors, or other corruption events.
+
+HOW IT WORKS:
+Claude Code stores session conversation data as JSONL files in:
+    ~/.claude/projects/<project-name>/<session-id>.jsonl
+
+The Claude Desktop app maintains a SEPARATE index of sessions in:
+    <app-data>/Claude/claude-code-sessions/<org-id>/<user-id>/local_<uuid>.json
+
+When the desktop app's index gets corrupted (e.g., from a BSOD), sessions
+disappear from the UI even though the conversation data is fully intact on
+disk. This tool rebuilds that index by creating registration files that point
+the desktop app back to the existing session data.
+
+USAGE:
+    python recover.py list                     # List all sessions on disk
+    python recover.py restore                  # Restore missing sessions to Desktop app
+    python recover.py restore --dry-run        # Preview what would be restored
+    python recover.py list --json              # Output as JSON
+    python recover.py list --project "website" # Filter by project name
+    python recover.py export                   # Export transcripts to ./exported-sessions/
+
+After running `restore`, restart Claude Desktop to see recovered sessions.
+
+Works on Windows, macOS, and Linux. Requires Python 3.8+.
+No external dependencies.
+"""
+
+import json
+import os
+import sys
+import glob
+import argparse
+import datetime
+import uuid as uuid_mod
+from pathlib import Path
+
+
+# --- Path Discovery ---
+
+def find_claude_dir():
+    """Find the ~/.claude directory."""
+    home = Path.home()
+    claude_dir = home / ".claude"
+    if claude_dir.exists():
+        return claude_dir
+
+    # Windows fallback: check under USERNAME
+    if sys.platform == "win32":
+        username = os.environ.get("USERNAME", "")
+        alt = Path(f"C:/Users/{username}/.claude")
+        if alt.exists():
+            return alt
+
+    print("ERROR: Could not find ~/.claude directory.")
+    print(f"  Searched: {home / '.claude'}")
+    print("  Pass --claude-dir to specify the path manually.")
+    sys.exit(1)
+
+
+def find_desktop_sessions_dir():
+    """Find the Claude Desktop app's session registration directory."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", "")) / "Claude" / "claude-code-sessions"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+    else:
+        # Linux: XDG_CONFIG_HOME or ~/.config
+        xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        base = Path(xdg) / "Claude" / "claude-code-sessions"
+
+    if not base.exists():
+        return None, None
+
+    # Find the org/user subdirectory (two levels of UUIDs)
+    for org_dir in base.iterdir():
+        if org_dir.is_dir():
+            for user_dir in org_dir.iterdir():
+                if user_dir.is_dir():
+                    return base, user_dir
+
+    return base, None
+
+
+# --- Session Scanning ---
+
+def extract_preview(filepath, max_bytes=50000):
+    """Extract the first human message from a session JSONL file."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_bytes)
+
+        for line in content.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line.strip())
+                t = obj.get("type", "")
+
+                # Format 1: queue-operation (Claude Desktop / Cowork)
+                if t == "queue-operation" and obj.get("operation") == "enqueue":
+                    c = obj.get("content", "")
+                    if c and len(c) > 3:
+                        return c[:120].replace("\n", " ").strip()
+
+                # Format 2: direct human message (Claude Code CLI)
+                if t == "human" or obj.get("role") == "human":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content_field = msg.get("content", "")
+                        if isinstance(content_field, str) and len(content_field) > 3:
+                            return content_field[:120].replace("\n", " ").strip()
+                        elif isinstance(content_field, list):
+                            for c in content_field:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    text = c["text"][:120].replace("\n", " ").strip()
+                                    if len(text) > 3:
+                                        return text
+
+                # Format 3: summary field
+                if obj.get("summary"):
+                    return obj["summary"][:120].replace("\n", " ").strip()
+
+            except json.JSONDecodeError:
+                continue
+
+    except Exception as e:
+        return f"(error: {e})"
+
+    return "(no preview available)"
+
+
+def derive_title(preview, max_len=60):
+    """Create a short title from the preview text."""
+    # Strip XML-like tags
+    title = preview
+    if title.startswith("<"):
+        # Try to get text after the tag
+        import re
+        title = re.sub(r"<[^>]+>", "", title).strip()
+
+    title = title[:max_len].replace("\n", " ").strip()
+    if len(preview) > max_len:
+        title += "..."
+    return title if title else "(recovered session)"
+
+
+def derive_work_dir(project_name):
+    """Convert a project folder name back to a filesystem path."""
+    work_dir = project_name.replace("--", os.sep)
+    if sys.platform == "win32":
+        if len(work_dir) > 1 and work_dir[1] == os.sep:
+            work_dir = work_dir[0] + ":" + work_dir[1:]
+    else:
+        if work_dir and work_dir[0] != "/":
+            work_dir = "/" + work_dir.replace("\\", "/")
+    return work_dir
+
+
+def scan_sessions(claude_dir, project_filter=None):
+    """Find all session JSONL files on disk."""
+    projects_dir = claude_dir / "projects"
+    if not projects_dir.exists():
+        print(f"ERROR: No projects directory at {projects_dir}")
+        sys.exit(1)
+
+    sessions = []
+    pattern = str(projects_dir / "*" / "*.jsonl")
+
+    for filepath in glob.glob(pattern):
+        filepath = Path(filepath)
+        session_id = filepath.stem
+        project = filepath.parent.name
+
+        if project_filter and project_filter.lower() not in project.lower():
+            continue
+
+        # Skip non-UUID filenames
+        if len(session_id) < 30 or "-" not in session_id:
+            continue
+
+        stat = filepath.stat()
+        modified = datetime.datetime.fromtimestamp(stat.st_mtime)
+        size_kb = stat.st_size // 1024
+        preview = extract_preview(filepath)
+
+        sessions.append({
+            "id": session_id,
+            "project": project,
+            "work_dir": derive_work_dir(project),
+            "date": modified.strftime("%Y-%m-%d %H:%M"),
+            "date_sort": modified,
+            "size_kb": size_kb,
+            "preview": preview,
+            "filepath": str(filepath),
+        })
+
+    sessions.sort(key=lambda s: s["date_sort"], reverse=True)
+    return sessions
+
+
+# --- Commands ---
+
+def cmd_list(args, claude_dir):
+    """List all sessions found on disk."""
+    sessions = scan_sessions(claude_dir, args.project)
+
+    if args.json:
+        output = [{k: v for k, v in s.items() if k != "date_sort"} for s in sessions]
+        print(json.dumps(output, indent=2))
+        return
+
+    if not sessions:
+        print("No sessions found on disk.")
+        return
+
+    print(f"\n{'=' * 100}")
+    print(f"  Found {len(sessions)} Claude Code sessions on disk")
+    print(f"{'=' * 100}\n")
+
+    for i, s in enumerate(sessions, 1):
+        size_str = f"{s['size_kb']}KB" if s['size_kb'] < 1024 else f"{s['size_kb'] / 1024:.1f}MB"
+        print(f"  {i:2}. [{s['date']}]  {size_str:>8}  {s['project']}")
+        print(f"      Preview: {s['preview'][:90]}")
+        print(f"      Resume:  claude --resume {s['id']}")
+        print()
+
+    print(f"{'=' * 100}")
+    print(f"  To resume any session from CLI:")
+    print(f"    cd <project-dir> && claude --resume <session-id>")
+    print(f"")
+    print(f"  To restore missing sessions to Claude Desktop:")
+    print(f"    python recover.py restore")
+    print(f"{'=' * 100}\n")
+
+
+def cmd_restore(args, claude_dir):
+    """Restore missing sessions to the Claude Desktop app."""
+    sessions = scan_sessions(claude_dir, args.project)
+
+    if not sessions:
+        print("No sessions found on disk.")
+        return
+
+    # Find the desktop app's session directory
+    base_dir, user_dir = find_desktop_sessions_dir()
+
+    if user_dir is None:
+        print("ERROR: Could not find Claude Desktop session directory.")
+        print("  The desktop app may not be installed, or hasn't been used yet.")
+        if base_dir:
+            print(f"  Found base dir: {base_dir}")
+            print(f"  But no org/user subdirectories exist inside it.")
+        print("")
+        print("  Make sure Claude Desktop is installed and you've opened at least")
+        print("  one Code session through it, then try again.")
+        sys.exit(1)
+
+    print(f"Desktop session dir: {user_dir}")
+
+    # Find already-registered session IDs
+    registered = set()
+    template = None
+    for reg_file in user_dir.glob("local_*.json"):
+        try:
+            with open(reg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cli_id = data.get("cliSessionId", "")
+            if cli_id:
+                registered.add(cli_id)
+            if template is None:
+                template = data  # Use first found as template
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    # Find sessions that need registration
+    to_restore = [s for s in sessions if s["id"] not in registered]
+
+    if not to_restore:
+        print(f"\nAll {len(sessions)} sessions are already registered. Nothing to restore.")
+        return
+
+    print(f"\n  Total sessions on disk:  {len(sessions)}")
+    print(f"  Already registered:      {len(registered)}")
+    print(f"  Sessions to restore:     {len(to_restore)}")
+
+    if args.dry_run:
+        print(f"\n  DRY RUN - would restore these sessions:\n")
+        for i, s in enumerate(to_restore, 1):
+            print(f"    {i:2}. [{s['date']}] {s['project']}")
+            print(f"        {derive_title(s['preview'])}")
+        print(f"\n  Run without --dry-run to restore.")
+        return
+
+    # Restore sessions
+    print(f"\n  Restoring...\n")
+    restored = 0
+    for s in to_restore:
+        local_id = str(uuid_mod.uuid4())
+        title = derive_title(s["preview"])
+
+        stat = Path(s["filepath"]).stat()
+        created_ts = int(stat.st_ctime * 1000)
+        modified_ts = int(stat.st_mtime * 1000)
+
+        session_data = {
+            "sessionId": f"local_{local_id}",
+            "cliSessionId": s["id"],
+            "cwd": s["work_dir"],
+            "originCwd": s["work_dir"],
+            "createdAt": created_ts,
+            "lastActivityAt": modified_ts,
+            "model": template.get("model", "claude-sonnet-4-20250514") if template else "claude-sonnet-4-20250514",
+            "effort": template.get("effort", "medium") if template else "medium",
+            "isArchived": False,
+            "title": title,
+            "permissionMode": template.get("permissionMode", "default") if template else "default",
+            "completedTurns": 1,
+        }
+
+        outpath = user_dir / f"local_{local_id}.json"
+        with open(outpath, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2)
+
+        restored += 1
+        print(f"    Restored: {title[:55]:55} ({s['id'][:8]}...)")
+
+    print(f"\n  Restored {restored} sessions.")
+    print(f"  Restart Claude Desktop to see them.")
+
+
+def cmd_export(args, claude_dir):
+    """Export session transcripts to readable text files."""
+    sessions = scan_sessions(claude_dir, args.project)
+
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    output_dir = Path(args.export_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    exported = 0
+    for s in sessions:
+        messages = extract_transcript(s["filepath"])
+        if not messages:
+            continue
+
+        safe_date = s["date"].replace(":", "").replace(" ", "_")
+        safe_name = f"{safe_date}_{s['project']}_{s['id'][:8]}.txt"
+        outpath = output_dir / safe_name
+
+        with open(outpath, "w", encoding="utf-8") as f:
+            f.write(f"Session: {s['id']}\n")
+            f.write(f"Project: {s['project']}\n")
+            f.write(f"Date:    {s['date']}\n")
+            f.write(f"CWD:     {s['work_dir']}\n")
+            f.write(f"Preview: {s['preview']}\n")
+            f.write(f"{'=' * 80}\n\n")
+
+            for role, content in messages:
+                f.write(f"--- {role} ---\n")
+                f.write(content)
+                f.write("\n\n")
+
+        exported += 1
+        print(f"  Exported: {outpath.name}")
+
+    print(f"\nExported {exported} sessions to {output_dir}/")
+
+
+def extract_transcript(filepath):
+    """Extract a readable transcript from a session JSONL file."""
+    messages = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line.strip())
+                    t = obj.get("type", "")
+                    role = obj.get("role", "")
+
+                    if t == "queue-operation" and obj.get("operation") == "enqueue":
+                        c = obj.get("content", "")
+                        if c:
+                            messages.append(("Human", c[:5000]))
+                    elif t == "human" or role == "human":
+                        msg = obj.get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                messages.append(("Human", content[:5000]))
+                            elif isinstance(content, list):
+                                texts = [c["text"] for c in content
+                                         if isinstance(c, dict) and c.get("type") == "text"]
+                                if texts:
+                                    messages.append(("Human", "\n".join(texts)[:5000]))
+                    elif t == "assistant" or role == "assistant":
+                        msg = obj.get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                messages.append(("Assistant", content[:5000]))
+                            elif isinstance(content, list):
+                                texts = [c["text"] for c in content
+                                         if isinstance(c, dict) and c.get("type") == "text"]
+                                if texts:
+                                    messages.append(("Assistant", "\n".join(texts)[:5000]))
+
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+
+    return messages
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Recover Claude Code sessions that disappeared from Claude Desktop",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python recover.py list                      List all sessions on disk
+  python recover.py list --json               Output as JSON for scripting
+  python recover.py list --project "website"  Filter by project name
+  python recover.py restore                   Re-register sessions in Desktop app
+  python recover.py restore --dry-run         Preview what would be restored
+  python recover.py export                    Export transcripts to text files
+        """,
+    )
+
+    parser.add_argument("--claude-dir", help="Override ~/.claude directory path")
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="List all sessions found on disk")
+    list_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    list_parser.add_argument("--project", help="Filter by project name substring")
+
+    # restore
+    restore_parser = subparsers.add_parser("restore", help="Restore missing sessions to Desktop app")
+    restore_parser.add_argument("--dry-run", action="store_true", help="Preview without making changes")
+    restore_parser.add_argument("--project", help="Filter by project name substring")
+
+    # export
+    export_parser = subparsers.add_parser("export", help="Export session transcripts to text files")
+    export_parser.add_argument("--export-dir", default="./exported-sessions", help="Output directory")
+    export_parser.add_argument("--project", help="Filter by project name substring")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    claude_dir = Path(args.claude_dir) if args.claude_dir else find_claude_dir()
+
+    if args.command == "list":
+        cmd_list(args, claude_dir)
+    elif args.command == "restore":
+        cmd_restore(args, claude_dir)
+    elif args.command == "export":
+        cmd_export(args, claude_dir)
+
+
+if __name__ == "__main__":
+    main()
