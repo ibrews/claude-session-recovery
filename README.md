@@ -2,6 +2,8 @@
 
 Recover Claude Code sessions that disappear from the Claude Desktop app after crashes, BSODs, or disk corruption.
 
+> **Wrong problem?** If Claude Desktop itself won't install or update (HRESULT `0x80073CF6` / `0x80073D05`), that's a Windows MSIX-layer issue this tool can't fix — see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for the ghost-AppX recovery recipe. If sessions are missing *after* a successful install/reinstall, you're in the right place; keep reading.
+
 ## The Problem
 
 Claude Code stores session conversations as JSONL files on disk:
