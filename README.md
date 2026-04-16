@@ -34,6 +34,14 @@ python recover.py restore
 - No external dependencies (stdlib only)
 - Works on Windows, macOS, and Linux
 
+## Things to Try
+
+1. **Run `python recover.py list`** — prints every session JSONL file on disk with date, size, first-message preview, and a ready-to-run `claude --resume` command for each.
+2. **Run `python recover.py restore --dry-run`** — shows exactly which sessions are missing from the Desktop app index without making any changes; safe to run any time.
+3. **Run `python recover.py restore` then restart Claude Desktop** — missing sessions reappear in the sidebar; run it again and it safely skips already-registered sessions.
+4. **Run `python recover.py export --export-dir ~/session-exports`** — writes every session as a readable plain-text transcript to the specified folder; useful for full-text search or archival.
+5. **Run `python recover.py list --project "my-project" --json`** — outputs structured JSON of all sessions under that project, ready to pipe into `jq` or another tool.
+
 ## Commands
 
 ### `list` — Find sessions on disk
