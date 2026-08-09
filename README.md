@@ -221,3 +221,11 @@ This tool was built during a real recovery session after a Windows BSOD corrupte
 ## License
 
 MIT
+
+## Support
+
+If you like seeing this kind of thing get built and shared, [donations are always welcome](https://www.alexcoulombepresents.com/support) — they buy hardware, render time, and the freedom to keep giving most of this away.
+
+## Credits
+
+Built by **Alex Coulombe Presents** ([ibrews](https://github.com/ibrews)).
