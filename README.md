@@ -122,7 +122,7 @@ When these index files are lost (corruption, reinstall, etc.), the Desktop app c
 
 ### Safety
 
-- **Non-destructive**: Only creates new files, never modifies or deletes existing ones
+- **Non-destructive**: Publishes each complete registration under a new filename and never replaces an existing one; filename collisions are retried
 - **Idempotent**: Safe to run multiple times — already-registered sessions are skipped
 - **Dry run**: Use `--dry-run` to preview changes before committing
 

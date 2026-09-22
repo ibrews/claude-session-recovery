@@ -38,11 +38,51 @@ import sys
 import glob
 import argparse
 import datetime
+import tempfile
 import uuid as uuid_mod
 from pathlib import Path
 
 
+# --- Safe Registration Publication ---
+
+RESTORE_REGISTRATION_ATTEMPTS = 100
+
+
+def publish_json_exclusive_atomic(outpath, data):
+    """Publish JSON at a new path without exposing partial or replaced data."""
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(outpath.parent),
+        prefix=f".{outpath.name}.",
+        suffix=".incomplete",
+    )
+    temp_path = Path(temp_name)
+    file_obj = None
+
+    try:
+        file_obj = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with file_obj:
+            json.dump(data, file_obj, indent=2)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        file_obj = None
+
+        # A hard link publishes the completed bytes atomically and fails if
+        # another registration already owns the requested final pathname.
+        os.link(str(temp_path), str(outpath))
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+        if fd is not None:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 # --- Path Discovery ---
+
 
 def find_claude_dir():
     """Find the ~/.claude directory."""
@@ -339,31 +379,40 @@ def cmd_restore(args, claude_dir):
     print(f"\n  Restoring...\n")
     restored = 0
     for s in to_restore:
-        local_id = str(uuid_mod.uuid4())
         title = derive_title(s["preview"])
 
         stat = Path(s["filepath"]).stat()
         created_ts = int(stat.st_ctime * 1000)
         modified_ts = int(stat.st_mtime * 1000)
 
-        session_data = {
-            "sessionId": f"local_{local_id}",
-            "cliSessionId": s["id"],
-            "cwd": s["work_dir"],
-            "originCwd": s["work_dir"],
-            "createdAt": created_ts,
-            "lastActivityAt": modified_ts,
-            "model": template.get("model", "claude-sonnet-4-20250514") if template else "claude-sonnet-4-20250514",
-            "effort": template.get("effort", "medium") if template else "medium",
-            "isArchived": False,
-            "title": title,
-            "permissionMode": template.get("permissionMode", "default") if template else "default",
-            "completedTurns": 1,
-        }
+        for _ in range(RESTORE_REGISTRATION_ATTEMPTS):
+            local_id = str(uuid_mod.uuid4())
+            session_data = {
+                "sessionId": f"local_{local_id}",
+                "cliSessionId": s["id"],
+                "cwd": s["work_dir"],
+                "originCwd": s["work_dir"],
+                "createdAt": created_ts,
+                "lastActivityAt": modified_ts,
+                "model": template.get("model", "claude-sonnet-4-20250514") if template else "claude-sonnet-4-20250514",
+                "effort": template.get("effort", "medium") if template else "medium",
+                "isArchived": False,
+                "title": title,
+                "permissionMode": template.get("permissionMode", "default") if template else "default",
+                "completedTurns": 1,
+            }
 
-        outpath = user_dir / f"local_{local_id}.json"
-        with open(outpath, "w", encoding="utf-8") as f:
-            json.dump(session_data, f, indent=2)
+            outpath = user_dir / f"local_{local_id}.json"
+            try:
+                publish_json_exclusive_atomic(outpath, session_data)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise RuntimeError(
+                "Could not allocate a unique Desktop registration filename "
+                f"after {RESTORE_REGISTRATION_ATTEMPTS} attempts."
+            )
 
         restored += 1
         print(f"    Restored: {title[:55]:55} ({s['id'][:8]}...)")
